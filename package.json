@@ -1,7 +1,7 @@
 {
   "name": "dsh-python-tempfile-shim",
-  "version": "0.1.0",
-  "description": "DeepSeek Harness plugin (temporary, pre-upstream-fix): lets Python run under the Windows sandbox despite CPython's 0o700 owner-only temp directories. Registers python_shim and pytest_run tools that inject a per-process sitecustomize shim through PYTHONPATH and run through the sandboxed shell executor — zero escalation.",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness plugin (temporary, pre-upstream-fix): automatically injects a CPython tempfile shim (PYTHONPATH -> sitecustomize) into every confined shell command on the Windows sandbox, so python/pytest tempfile use works with zero extra tools, zero model-context overhead, and zero escalation.",
   "keywords": [
     "dsh-plugin",
     "dsh",
@@ -46,8 +46,7 @@
     "node": ">=20"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+    "@deepseek-ai/cordis": "^4.0.1"
   },
   "scripts": {
     "test": "node test/smoke.mjs"

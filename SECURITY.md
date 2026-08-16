@@ -7,46 +7,53 @@ and the trade-off accepted by installing it.
 ## Risk notice
 
 - Temporary mitigation for one specific Windows incompatibility, not a fix.
-- Drops CPython's `0o700` directory semantics inside injected runs (see the
+- Drops CPython's `0o700` directory semantics inside confined runs (see the
   trade-off section below).
-- The tools have no escalation surface; runs denied for other reasons must be
-  re-run through the pwsh tool.
+- There are no dedicated tools and no escalation surface; nothing in this
+  plugin can widen the sandbox.
 - The shim must not be installed globally.
 - On non-Windows platforms the plugin registers nothing.
 
 ## Threat model
 
 The plugin runs inside the DSH host process as a Cordis plugin, like the
-shipped tools, and holds no secrets. Commands submitted by the model through
-these tools are treated like the pwsh tool's `command` parameter: the model
-can already execute arbitrary PowerShell inside the sandbox. These tools only
-prepend an environment variable and add no execution capability.
+shipped tools, and holds no secrets. It does not execute anything itself and
+does not inspect or modify command text. Its only runtime effect is adding one
+`PYTHONPATH` entry to the environment of commands that the shell executor was
+about to run confined anyway; the model can already execute arbitrary
+PowerShell inside the sandbox through the pwsh tool, so this adds no execution
+capability.
 
 ## What it does
 
-1. Registers the `python_shim` and `pytest_run` tools and one skill.
-2. For each run, builds
-   `$env:PYTHONPATH = '<plugin assets dir>' + $(if ($env:PYTHONPATH) { ';' + $env:PYTHONPATH }); python <args>`
-   and executes it through `ctx.shell`, the same sandboxed executor the pwsh
-   tool uses.
+1. Patches the mounted shell executor's `resolve()` (the request→spec seam
+   every shell consumer uses) so resolved specs for confined calls
+   (`read-only` / `workspace-write`) carry
+   `env.PYTHONPATH = <plugin assets dir>[;existing]`.
+2. Registers a compact always-on system-prompt section and one
+   `python-tempfile-shim` skill so the model knows the fix is automatic.
 3. The bundled `assets/sitecustomize.py` replaces `os.mkdir`, ignoring the
    `mode` argument: directories created by the injected process inherit the
    parent ACL instead of CPython's `0o700` owner-only DACL.
 
 ## What it does not do
 
-- No direct child-process spawn. Execution always goes through `ctx.shell`,
-  where the sandbox runner confines it; a direct spawn would run under the
-  full token.
-- No `sandbox_permissions`/`justification` fields. The tools cannot request a
-  wider sandbox mode; if a run is denied for another reason, re-run it through
-  the pwsh tool.
+- No direct child-process spawn and no command rewriting. Execution paths,
+  the sandbox runner, and the escalation surface are exactly the ones the
+  mounted executor provides.
+- No `sandbox_permissions`/`justification` capability. The plugin cannot
+  request a wider sandbox mode for anything.
 - No sandbox changes. The token's restricting-SID list, workspace/temp ACEs,
   policy, and escalation surface are unchanged.
-- No global installation. `PYTHONPATH` is injected per process tree; nothing
-  is written to site-packages, the registry, or machine-wide configuration.
+- No global installation. `PYTHONPATH` is injected per process tree of
+  confined commands only; nothing is written to site-packages, the registry,
+  or machine-wide configuration.
+- No injection outside confinement. Unconfined compositions (no sandboxing
+  executor) and `danger-full-access` calls never receive the shim, so
+  CPython's `0o700` default stays intact wherever the sandbox is not the
+  problem.
 
-## Trade-off: 0o700 semantics are dropped inside injected processes
+## Trade-off: 0o700 semantics are dropped inside confined processes
 
 `0o700` is CPython's privacy hardening (temp directories readable only by
 their owner). With the shim, directories created by that process inherit the
@@ -67,14 +74,18 @@ to the Windows ACL restricted-token backend.
 
 ## Residual risks
 
-1. The model-supplied `args` is appended to a PowerShell command and
-   interpreted by pwsh, with the same risk as the pwsh tool's `command`
-   parameter.
+1. A confined command that explicitly resets `$env:PYTHONPATH` (or a tool
+   that spawns Python with a scrubbed environment) drops the shim for its own
+   process tree; the failure then re-appears and the skill's guidance is to
+   report it, not to escalate.
 2. If CPython stops building directory DACLs from `os.mkdir`'s mode on
    Windows, the shim would only change `0o700` semantics.
 3. The Windows sandbox backend itself reports `enforcement: partial`
    (Everyone ambient ACEs and similar boundaries); this is unrelated to the
    plugin.
+4. Dev-time HMR that reloads the shell executor plugin alone mounts a fresh
+   executor instance without this patch until this plugin (or the whole DSH)
+   also reloads.
 
 ## Retirement
 

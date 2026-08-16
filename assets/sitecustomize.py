@@ -1,6 +1,8 @@
 """DSH sandbox shim for Python on Windows: 0o700 directory creation vs the
 WRITE_RESTRICTED token. Bundled by the dsh-python-tempfile-shim plugin;
-injected ONLY into sandboxed python runs through PYTHONPATH. Never install
+injected automatically into every CONFINED shell command through the shell
+executor's environment (PYTHONPATH), so any python/pytest/pip/tox run —
+including subprocesses — picks it up with no dedicated tools. Never install
 this file globally (site-packages).
 
 Root cause chain (verified):

@@ -13,6 +13,30 @@
 `tmp_path`/`tmpdir` 测试表现为 `[Errno 13]` / `WinError 5`，并带有
 `[sandbox: file access denied under workspace-write mode]` 标记。
 
+## 原理——全自动注入，无需任何额外工具
+
+插件包装挂载的 shell 执行器的 `resolve()`——所有 shell 消费方（pwsh 工具、
+后台任务、进程内插件桥接）共同经过的唯一收口点——使**每一条受限命令**
+（`workspace-write` / `read-only`）都继承 `PYTHONPATH=<插件 assets 目录>`。
+随附的 `assets/sitecustomize.py` 让 `os.mkdir` 忽略 mode 参数，新目录继承父目录
+ACL（其中含沙箱授予的工作区/临时目录写 ACE），而不是 CPython 的仅所有者 DACL。
+
+由于注入发生在执行器层面：
+
+- **无需记忆额外工具**——`python`、`pytest`、`pip`、`tox`、`nox`、虚拟环境以及
+  任何子 Python 进程都会自动获得修复。
+- **不增加模型上下文**——agent 照常通过 pwsh 运行 Python；插件注册了一段
+  常驻系统提示词说明修复是自动的，agent 无需任何特殊动作。
+- **零升权**——沙箱边界完全不动：令牌、ACE、策略与升权面均不变。
+
+`PYTHONPATH` 对非 Python 命令无副作用，因此给每条受限命令附加它是安全的；
+命令自行设置 `$env:PYTHONPATH` 时仍可覆盖。对于未沙箱的组合与
+`danger-full-access` 运行，插件**刻意不注入**（那里不存在该 bug，且 `0o700`
+是 CPython 的隐私加固，未沙箱运行应保留）。
+
+同时注册 `python-tempfile-shim` skill，供人类查阅以及在罕见的仍然失败时
+进行诊断与上报。
+
 ## 范围
 
 - 所有以 `0o700` 建目录的路径都经过 `os.mkdir`：`tempfile.mkdtemp`、
@@ -21,25 +45,6 @@
   传播到子进程）。
 - 仅 Windows 生效；其他平台 `apply()` 不注册任何内容。
 - 文件创建（`os.open`/`mkstemp` 的 mode）不受影响，无需处理。
-
-## 工具
-
-| 工具 | 用途 |
-| --- | --- |
-| `python_shim` | 运行任意 Python 命令，`args` 为 `python` 之后的命令行，如 `"-m pytest -q tests"`、`"script.py --flag"`、`"-m tox"`。 |
-| `pytest_run` | `python_shim` 的便捷封装，等价于 `python -m pytest <args>`。 |
-
-同时注册 `python-tempfile-shim` skill，说明工具的适用场景与注意事项。
-
-两个工具通过 `ctx.shell` 执行，与 pwsh 工具使用相同的沙箱执行器，在
-workspace-write 下运行，不需要升权。工具不提供 `sandbox_permissions`/
-`justification` 字段；若因其他原因被沙箱拒绝，请通过 pwsh 工具的升权面重跑。
-
-## 原理
-
-工具把 `assets/sitecustomize.py` 前置到 `PYTHONPATH` 后运行 `python ...`。
-该 shim 使 `os.mkdir` 忽略 mode 参数，新目录继承父目录 ACL（其中含沙箱授予的
-工作区/临时目录写 ACE）。沙箱本身的令牌、ACE、策略与升权面均不改变。
 
 ## 安装
 
@@ -55,12 +60,13 @@ dsh plugin --profile web add link:<clone 目录的绝对路径>
 ## 验证
 
 - 环境：Windows、DSH workspace-write 沙箱、Python 3.11.15 / 3.13.14、pytest 9.1.1。
-  - 不注入 shim：`tmp_path` 测试 `PermissionError: [WinError 5]`。
-  - 注入 shim：`1 passed`；`mkdtemp`、`TemporaryDirectory`、`mkstemp`、basetemp
-    清理正常。
+  - 未装插件：`tmp_path` 测试 `PermissionError: [WinError 5]`。
+  - 装插件后：通过普通 pwsh 工具直接运行即可 `1 passed`；`mkdtemp`、
+    `TemporaryDirectory`、`mkstemp`、basetemp 清理正常。
 - 子进程传播：父 Python 进程到子 Python 进程（继承 `PYTHONPATH`）正常。
-- 冒烟测试：`npm test`，覆盖工具/skill 注册、命令构造、沙箱策略透传、拒绝渲染
-  （不含升权提示）、后台任务、校验错误面。
+- 冒烟测试：`npm test`，覆盖 resolve 包装契约（受限模式注入、
+  `danger-full-access`/未沙箱不注入、幂等、恢复、不改动入参）以及
+  提示词段落与 skill 注册。
 
 ## 安全
 

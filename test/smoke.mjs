@@ -3,127 +3,148 @@
  *
  * Loads the plugin against a plain-object Cordis-like context (no real DSH
  * server needed) and asserts the behavior contract:
- *  1. apply() registers python_shim + pytest_run + the skill on win32.
- *  2. Commands carry the PYTHONPATH shim injection and run through ctx.shell
- *     with the standing sandbox policy passed through (never a direct spawn).
- *  3. Denial rendering keeps the [sandbox: ...] marker but NEVER appends an
- *     escalation hint (the tools have no escalation surface by design).
- *  4. Background runs register with the jobs runtime.
- *  5. Semantic validation failures surface as {error}.
+ *  1. apply() registers the always-on system-prompt section + the skill, and
+ *     patches the mounted shell executor's resolve() (win32 only).
+ *  2. Confined calls (workspace-write / read-only) get PYTHONPATH=<shim dir>
+ *     added to the resolved spec's env; an existing PYTHONPATH is preserved
+ *     with the shim prepended; other env entries are untouched.
+ *  3. danger-full-access calls and unsandboxed compositions never get the
+ *     shim (0o700 semantics stay intact there); the patch is not even
+ *     installed on an executor that never confines.
+ *  4. The patch is idempotent across repeated apply() and its disposer
+ *     restores the original resolve().
+ *  5. withShimEnv never mutates the caller's spec.
  *
  * Run: node test/smoke.mjs
  */
 
 import assert from 'node:assert/strict'
 import { apply } from '../lib/index.js'
+import { installShellHook, withShimEnv, SHIM_DIR } from '../lib/shell-hook.js'
 
-const registeredTools = []
+const registeredSections = []
 const registeredSkills = []
-const services = new Map()
-const requests = []
+const effects = []
 
-function fakeForeground(overrides = {}) {
+function fakeShell(overrides = {}) {
   return {
-    aborted: false,
-    exitCode: 0,
-    signal: null,
-    timedOut: false,
-    stdout: { text: 'hello\n', truncated: false },
-    stderr: { text: '', truncated: false },
+    sandboxMode: 'workspace-write',
+    resolveCalls: 0,
+    resolve(req) {
+      this.resolveCalls += 1
+      return {
+        ...req,
+        sandboxPolicy:
+          req.sandboxPolicy ?? { mode: 'workspace-write', workspaceRoot: 'D:/proj' },
+      }
+    },
     ...overrides,
   }
 }
 
-services.set('shell', {
-  sandboxMode: 'workspace-write',
-  resolve(req) {
-    requests.push(req)
-    return req
-  },
-  async run() {
-    return fakeForeground()
-  },
-  start() {
-    return { kill() {}, done: Promise.resolve(), readOutput: () => ({ delta: '' }) }
-  },
-})
-services.set('shellEnv', { collect: () => ({}) })
-services.set('sandboxPolicy', {
-  resolve: () => ({ mode: 'workspace-write', workspaceRoot: 'D:/proj' }),
-})
-services.set('jobs', {
-  start(spec) {
-    services.set('lastJobSpec', spec)
-    return 'job-1'
-  },
-})
-
-const ctx = {
-  tools: { register: (t) => registeredTools.push(t) },
-  skills: { register: (s) => registeredSkills.push(s) },
-  get: (name) => services.get(name),
+function makeCtx(shell) {
+  const services = new Map()
+  if (shell !== null) services.set('shell', shell)
+  return {
+    get: (name) => services.get(name),
+    systemPrompt: { section: (s) => registeredSections.push(s) },
+    skills: { register: (s) => registeredSkills.push(s) },
+    effect: (fn) => effects.push(fn()),
+  }
 }
+
+assert.equal(process.platform, 'win32', 'smoke test exercises the win32 path')
+
+// --- 1. apply() wiring on a confined composition. -------------------------
+const shell = fakeShell()
+const originalResolve = shell.resolve
+const ctx = makeCtx(shell)
 
 apply(ctx)
 
-assert.equal(process.platform, 'win32', 'smoke test exercises the win32 path')
-const byName = Object.fromEntries(registeredTools.map((t) => [t.name, t]))
-assert.deepEqual(Object.keys(byName).sort(), ['pytest_run', 'python_shim'])
+assert.equal(registeredSections.length, 1, 'one system-prompt section registered')
+assert.equal(registeredSections[0].name, 'plugin:python-tempfile-shim')
+assert.equal(typeof registeredSections[0].order, 'number')
+assert.ok(registeredSections[0].text.includes('automatic'), 'section says the fix is automatic')
 assert.equal(registeredSkills.length, 1)
 assert.equal(registeredSkills[0].name, 'python-tempfile-shim')
 assert.equal(typeof registeredSkills[0].source, 'string', 'skill source is required by the loader')
+assert.notEqual(shell.resolve, originalResolve, 'resolve() was patched')
+assert.equal(effects.length, 1, 'the restore disposer is registered with ctx.effect')
 
-const exec = {
-  agent: { session: { header: { cwd: 'D:/proj' } } },
-  signal: new AbortController().signal,
-  callId: 't1',
-}
+// --- 2. Confined calls get the shim env; existing env is preserved. -------
+const spec1 = shell.resolve({ command: 'python -m pytest -q tests' })
+assert.ok(spec1.env && typeof spec1.env.PYTHONPATH === 'string', 'PYTHONPATH injected')
+assert.ok(spec1.env.PYTHONPATH.startsWith(SHIM_DIR), 'shim dir comes first: ' + spec1.env.PYTHONPATH)
+assert.equal(spec1.sandboxPolicy.mode, 'workspace-write')
 
-// 1. python_shim foreground: shim injection + sandbox policy + workdir.
-requests.length = 0
-const out1 = await byName.python_shim.execute(
-  { args: '-m pytest -q tests', description: 'Run tests' },
-  exec,
+const spec2 = shell.resolve({
+  command: 'python -c 1',
+  env: { PYTHONPATH: 'C:/elsewhere', FOO: 'bar' },
+})
+assert.equal(
+  spec2.env.PYTHONPATH,
+  `${SHIM_DIR};C:/elsewhere`,
+  'existing PYTHONPATH kept, shim prepended: ' + spec2.env.PYTHONPATH,
 )
-assert.equal(out1.kind, 'foreground')
-assert.equal(requests.length, 1)
-const req1 = requests[0]
-assert.ok(req1.command.startsWith(`$env:PYTHONPATH = '`), 'shim injection present: ' + req1.command)
-assert.ok(req1.command.includes('assets'), 'shim dir path in command: ' + req1.command)
-assert.ok(req1.command.endsWith('python -m pytest -q tests'), 'argv appended: ' + req1.command)
-assert.deepEqual(req1.sandboxPolicy, { mode: 'workspace-write', workspaceRoot: 'D:/proj' })
-assert.equal(req1.workdir, 'D:/proj')
+assert.equal(spec2.env.FOO, 'bar', 'other env entries untouched')
 
-// 2. pytest_run defaults to `python -m pytest`.
-requests.length = 0
-const out2 = await byName.pytest_run.execute({ description: 'Run pytest' }, exec)
-assert.equal(out2.kind, 'foreground')
-assert.equal(requests.length, 1)
-assert.ok(requests[0].command.endsWith('python -m pytest'), requests[0].command)
+const spec3 = shell.resolve({
+  command: 'pytest',
+  sandboxPolicy: { mode: 'read-only', workspaceRoot: 'D:/proj' },
+})
+assert.ok(spec3.env && spec3.env.PYTHONPATH.startsWith(SHIM_DIR), 'read-only also injected')
 
-// 3. Denial rendering: marker present, escalation hint ABSENT by design.
-const denied = {
-  ...fakeForeground({ exitCode: 1 }),
-  sandbox: { mode: 'workspace-write', denied: true },
+// --- 3. Unconfined paths must stay shim-free. -----------------------------
+const spec4 = shell.resolve({
+  command: 'python -c 1',
+  sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: 'D:/proj' },
+})
+assert.equal(spec4.env, undefined, 'danger-full-access gets no shim env')
+
+const bare = { sandboxMode: undefined }
+const bareSpec = withShimEnv({ command: 'python -c 1', sandboxPolicy: undefined }, bare)
+assert.equal(bareSpec.env, undefined, 'no sandbox mode -> no injection')
+
+// Unsandboxed composition: the hook is not installed at all.
+const unconfinedShell = fakeShell({ sandboxMode: undefined })
+const unconfinedOriginal = unconfinedShell.resolve
+const unconfinedCtx = makeCtx(unconfinedShell)
+apply(unconfinedCtx)
+assert.equal(unconfinedShell.resolve, unconfinedOriginal, 'unsandboxed executor untouched')
+const unconfinedSpec = unconfinedShell.resolve({ command: 'python -c 1' })
+assert.equal(unconfinedSpec.env, undefined, 'unsandboxed executor untouched')
+
+// --- 4. Idempotency + disposal. -------------------------------------------
+const patchedResolve = shell.resolve
+apply(ctx) // re-apply (plugin reload race): must not double-wrap
+assert.equal(shell.resolve, patchedResolve, 'repeat apply keeps one wrapper')
+assert.equal(shell.resolveCalls, 4, 'original resolve called exactly once per wrapped call')
+
+effects[0]() // dispose the first registration's restore
+assert.equal(shell.resolve, originalResolve, 'disposer restored the original resolve')
+
+// Re-installing after disposal works (fresh patch, single wrapper again).
+const restore2 = installShellHook(ctx)
+assert.notEqual(shell.resolve, originalResolve)
+const spec5 = shell.resolve({ command: 'python -c 1' })
+assert.ok(spec5.env.PYTHONPATH.startsWith(SHIM_DIR))
+restore2()
+assert.equal(shell.resolve, originalResolve, 'restore2 clean')
+
+// --- 5. withShimEnv never mutates the caller's spec. ----------------------
+const input = {
+  command: 'python -c 1',
+  sandboxPolicy: { mode: 'workspace-write', workspaceRoot: 'D:/proj' },
+  env: { A: '1' },
 }
-const rendered = byName.python_shim.output.render({}, denied)[0].text
-assert.ok(rendered.includes('[sandbox: file access denied under workspace-write mode]'))
-assert.ok(!rendered.includes('escalation available'), 'escalation hint must be absent by design')
-
-// 4. Background path registers with jobs.
-requests.length = 0
-const out3 = await byName.pytest_run.execute(
-  { description: 'Run pytest bg', run_in_background: true },
-  exec,
-)
-assert.deepEqual(out3, { kind: 'background', jobId: 'job-1' })
-assert.equal(services.get('lastJobSpec').kind, 'pytest-run')
-
-// 5. Validation failures surface as {error}, never as a thrown crash.
-const out4 = await byName.python_shim.execute({ args: '   ', description: 'x' }, exec)
-assert.equal(typeof out4.error, 'string')
-assert.ok(out4.error.length > 0)
+const output = withShimEnv(input, { sandboxMode: 'workspace-write' })
+assert.notEqual(output, input, 'returns a copy')
+assert.equal(input.env.PYTHONPATH, undefined, 'input env untouched')
+assert.deepEqual(input.env, { A: '1' })
+assert.equal(output.env.A, '1')
 
 console.log(
-  `smoke OK: tools=${Object.keys(byName).join(',')} skills=${registeredSkills.length} requests=${requests.length}`,
+  `smoke OK: sections=${registeredSections.length} skills=${registeredSkills.length} ` +
+    `patched=${patchedResolve !== originalResolve}`,
 )
