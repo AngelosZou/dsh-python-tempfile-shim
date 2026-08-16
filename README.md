@@ -53,7 +53,7 @@ unchanged.
 
 ```powershell
 git clone https://github.com/AngelosZou/dsh-python-tempfile-shim.git
-dsh plugin --profile web add link:<clone 目录的绝对路径>
+dsh plugin --profile web add link:<local repositry path>
 ```
 
 Restart DSH afterwards.
