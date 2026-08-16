@@ -1,0 +1,55 @@
+{
+  "name": "dsh-python-tempfile-shim",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin (temporary, pre-upstream-fix): lets Python run under the Windows sandbox despite CPython's 0o700 owner-only temp directories. Registers python_shim and pytest_run tools that inject a per-process sitecustomize shim through PYTHONPATH and run through the sandboxed shell executor — zero escalation.",
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "deepseek-harness",
+    "python",
+    "tempfile",
+    "pytest",
+    "sandbox",
+    "windows"
+  ],
+  "license": "MIT",
+  "author": "Yutong Zou <yutong.zou.24@alumni.ucl.ac.uk> (https://github.com/AngelosZou)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AngelosZou/dsh-python-tempfile-shim.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AngelosZou/dsh-python-tempfile-shim/issues"
+  },
+  "homepage": "https://github.com/AngelosZou/dsh-python-tempfile-shim#readme",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "assets",
+    "cordis.patch.yml",
+    "SECURITY.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+  },
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  }
+}
